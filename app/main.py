@@ -6,7 +6,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from app.models import TaskResponse, TaskSubmission
-from app.store import task_store
+from app.history_store import history_task_store as task_store
+from app.history import get_job_history
 from app.task_registry import available_task_types, get_task
 
 app = FastAPI(
@@ -78,6 +79,14 @@ def get_task_status(task_id: str) -> TaskResponse:
             detail=f"Task '{task_id}' not found. It may not exist or may have expired.",
         )
     return TaskResponse(**task_data)
+
+
+@app.get("/history/tasks/{task_id}", summary="Get PostgreSQL task history")
+def get_persisted_task_history(task_id: str) -> dict:
+    events = get_job_history(task_id)
+    if not events:
+        raise HTTPException(status_code=404, detail="No persistent history for this task")
+    return {"task_id": task_id, "events": events}
 
 
 @app.get("/metrics", summary="Get queue metrics")

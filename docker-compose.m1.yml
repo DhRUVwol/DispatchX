@@ -1,0 +1,57 @@
+# Layer this on top of the original docker-compose.yml.
+# Local-development credentials only; do not deploy this unchanged.
+# x-history-env: &history-env
+#   DATABASE_URL: postgresql+psycopg://dispatchx:dispatchx_dev_password@postgres:5432/dispatchx
+x-history-env: &history-env
+  DATABASE_URL: postgresql+psycopg://dispatchx:dispatchx_dev_password@postgres:5432/dispatchx
+  PYTHONPATH: /app
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: dispatchx
+      POSTGRES_PASSWORD: dispatchx_dev_password
+      POSTGRES_DB: dispatchx
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dispatchx -d dispatchx"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - dispatchx_pgdata:/var/lib/postgresql/data
+
+  migrate:
+    build: .
+    command: alembic upgrade head
+    environment: *history-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    environment: *history-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  worker1:
+    environment: *history-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  worker2:
+    environment: *history-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  worker3:
+    environment: *history-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  dispatchx_pgdata:

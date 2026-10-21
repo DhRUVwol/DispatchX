@@ -19,6 +19,7 @@ import redis
 
 from app.config import settings
 from app.store import TaskStore
+from app.history_store import AuditedTaskStore
 from app.task_registry import available_task_types, get_task
 
 logging.basicConfig(
@@ -299,7 +300,7 @@ def worker_iteration(
 
 def run_worker(worker_id: str) -> None:
     """Run the infinite worker loop used by production and Docker containers."""
-    store = TaskStore(
+    store = AuditedTaskStore(
         redis_url=settings.redis_url,
         queue_name=settings.queue_name,
         dead_letter_queue_name=settings.dead_letter_queue_name,
