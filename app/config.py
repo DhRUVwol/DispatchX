@@ -31,6 +31,8 @@ class Settings:
         self.worker_poll_timeout = int(os.getenv("WORKER_POLL_TIMEOUT", "1"))
         self.worker_heartbeat_ttl = int(os.getenv("WORKER_HEARTBEAT_TTL", "30"))
 
+        self.worker_recovery_grace = max(1, int(os.getenv("WORKER_RECOVERY_GRACE", "10")))
+
         # Optional one-shot URL override that is convenient in tests.
         self.redis_url_override = os.getenv("REDIS_URL")
 

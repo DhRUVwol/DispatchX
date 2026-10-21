@@ -10,13 +10,14 @@ import os
 import queue
 import signal
 import sys
+import time
 import uuid
 from dataclasses import dataclass
-from datetime import timedelta, timezone, datetime
-from typing import Any, cast
+from typing import Any
 
 import redis
 
+from app.recurring import RecurringStore
 from app.config import settings
 from app.store import TaskStore
 from app.history_store import AuditedTaskStore
@@ -167,14 +168,14 @@ def process_task(
     redis_client: Any,
     store: TaskStore,
     worker_id: str,
+    claimed_task: dict | None = None,
 ) -> dict[str, Any] | None:
     """Execute one queued task and persist the result."""
     store.touch_worker_heartbeat(worker_id)
-    task_key = f"task:{task_id}"
-    task_data = cast(dict[str, str], redis_client.hgetall(task_key))
-    if not task_data:
-        logger.warning("[%s] Task %s not found in Redis - skipping", worker_id, task_id)
+    task_data = claimed_task or store.claim_task(worker_id, task_id)
+    if task_data is None:
         return None
+    token = task_data["execution_token"]
 
     task_type = task_data.get("task_type") or task_data.get("task_name", "unknown")
     retry_count = int(task_data.get("retry_count", "0"))
@@ -186,15 +187,11 @@ def process_task(
         worker_id,
         task_id,
         task_type,
-        int(task_data.get("attempt_count", "0")) + 1,
+        int(task_data.get("attempt_count", "0")),
         retry_count,
         max_retries,
         timeout_seconds,
     )
-
-    running_task = store.mark_running(task_id, worker_id)
-    if running_task is None:
-        return None
 
     task_args, task_kwargs = _load_task_payload(task_data)
     task_kwargs["_retry_count"] = retry_count
@@ -206,74 +203,17 @@ def process_task(
         timeout_seconds=timeout_seconds,
     )
 
-    if outcome.succeeded:
-        logger.info("[%s] Task %.8s COMPLETED - result=%s", worker_id, task_id, outcome.result)
-        return store.mark_completed(task_id, outcome.result, worker_id)
-
-    assert outcome.error_message is not None
-    assert outcome.failure_type is not None
-    assert outcome.failure_reason is not None
-
-    next_retry_count = retry_count + 1
-
-    if outcome.failure_type == "unknown_task":
-        logger.error(
-            "[%s] Task %.8s DEAD-LETTERED immediately - %s",
-            worker_id,
-            task_id,
-            outcome.error_message,
-        )
-        return store.dead_letter_task(
-            task_id,
-            worker_id=worker_id,
-            error_message=outcome.error_message,
-            failure_type=outcome.failure_type,
-            failure_reason=outcome.failure_reason,
-        )
-
-    if next_retry_count <= max_retries:
-        backoff_seconds = 2 ** retry_count
-        retry_at = datetime.now(timezone.utc) + timedelta(seconds=backoff_seconds)
-        logger.warning(
-            "[%s] Task %.8s FAILED - scheduling retry %d/%d at %s: %s",
-            worker_id,
-            task_id,
-            next_retry_count,
-            max_retries,
-            retry_at.isoformat(),
-            outcome.error_message,
-        )
-        store.record_failure(
-            task_id,
-            worker_id=worker_id,
-            error_message=outcome.error_message,
-            failure_type=outcome.failure_type,
-            failure_reason=outcome.failure_reason,
-        )
-        store.schedule_retry(task_id, retry_count=next_retry_count, run_at=retry_at)
-        logger.info(
-            "[%s] Scheduled retry for task %.8s (retry %d/%d)",
-            worker_id,
-            task_id,
-            next_retry_count,
-            max_retries,
-        )
-        return store.get_task(task_id)
-
-    logger.error(
-        "[%s] Task %.8s DEAD-LETTERED after %d retries - %s",
-        worker_id,
-        task_id,
-        retry_count,
-        outcome.error_message,
-    )
-    return store.dead_letter_task(
-        task_id,
-        worker_id=worker_id,
+    updated = store.finish_execution(
+        task_id, token, result=outcome.result,
         error_message=outcome.error_message,
         failure_type=outcome.failure_type,
         failure_reason=outcome.failure_reason,
     )
+    if updated is None:
+        logger.warning("[%s] Ignored stale outcome for task %s", worker_id, task_id)
+    else:
+        logger.info("[%s] Task %.8s %s", worker_id, task_id, updated["status"])
+    return updated
 
 
 def worker_iteration(
@@ -284,18 +224,22 @@ def worker_iteration(
     timeout: int = 0,
 ) -> bool:
     """Process at most one task from the queue and report whether work happened."""
-    store.touch_worker_heartbeat(worker_id)
-    promoted = store.promote_due_scheduled_tasks()
-    if promoted:
-        logger.info("[%s] Promoted %d scheduled task(s) into runnable queues", worker_id, promoted)
-
-    result = redis_client.brpop(queue_names, timeout=timeout)
-    if result is None:
-        return False
-
-    _, task_id = result
-    process_task(task_id, redis_client, store, worker_id)
-    return True
+    # Polling permits atomic priority selection and regular recovery while idle.
+    deadline = time.monotonic() + timeout
+    while True:
+        store.touch_worker_heartbeat(worker_id)
+        recovered = store.recover_expired_tasks()
+        if recovered:
+            logger.warning("[%s] Recovered %d expired task(s)", worker_id, recovered)
+        RecurringStore(store).tick()
+        store.promote_due_scheduled_tasks()
+        claimed = store.claim_task(worker_id)
+        if claimed is not None:
+            process_task(claimed["task_id"], redis_client, store, worker_id, claimed)
+            return True
+        if timeout > 0 and time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
 
 
 def run_worker(worker_id: str) -> None:
@@ -309,7 +253,7 @@ def run_worker(worker_id: str) -> None:
     redis_client: Any = redis.from_url(settings.redis_url, decode_responses=True)
 
     logger.info("[%s] Starting - connected to %s", worker_id, settings.redis_url)
-    logger.info("[%s] Listening on queues %s (BRPOP)...", worker_id, store.runnable_queue_names())
+    logger.info("[%s] Listening on queues %s (atomic claim)...", worker_id, store.runnable_queue_names())
 
     while True:
         worker_iteration(

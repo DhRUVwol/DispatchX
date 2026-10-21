@@ -34,6 +34,7 @@ class TaskStatus(str, Enum):
     SCHEDULED = "scheduled"
     RUNNING = "running"
     COMPLETED = "completed"
+    CANCELLED = "cancelled"
     FAILED = "failed"
     DEAD_LETTERED = "dead_lettered"
 
@@ -177,3 +178,13 @@ class TaskResponse(BaseModel):
         ...,
         description="Timestamp when the task last changed state.",
     )
+
+
+class RecurringSubmission(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    interval_seconds: int = Field(ge=10, le=31536000)
+    task: TaskSubmission
+
+
+class RecurringUpdate(BaseModel):
+    enabled: bool

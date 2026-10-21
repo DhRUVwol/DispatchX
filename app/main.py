@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
-from fastapi import FastAPI, HTTPException
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException, Header, Query
+from fastapi.requests import Request
+from sqlalchemy.exc import SQLAlchemyError
+from app.recurring import RecurringStore
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from app.models import TaskResponse, TaskSubmission
+from app.models import TaskResponse, TaskSubmission, TaskStatus, RecurringSubmission, RecurringUpdate
 from app.history_store import history_task_store as task_store
 from app.history import get_job_history
 from app.task_registry import available_task_types, get_task
@@ -31,7 +36,7 @@ def get_task_store():
     status_code=201,
     summary="Submit a new task",
 )
-def submit_task(submission: TaskSubmission) -> JSONResponse:
+def submit_task(submission: TaskSubmission, idempotency_key: str | None = Header(default=None, min_length=1, max_length=200)) -> JSONResponse:
     """
     Create a task record and queue it for a worker.
 
@@ -59,6 +64,7 @@ def submit_task(submission: TaskSubmission) -> JSONResponse:
         timeout_seconds=submission.timeout_seconds,
         priority=submission.priority,
         run_at=submission.run_at,
+        idempotency_key=idempotency_key,
     )
     response = TaskResponse(**task_data)
     return JSONResponse(content=response.model_dump(mode="json"), status_code=201)
@@ -97,50 +103,66 @@ def get_metrics() -> dict:
 
 @app.get("/dashboard", response_class=HTMLResponse, summary="View dashboard")
 def get_dashboard() -> HTMLResponse:
-    """Serve a minimal local dashboard backed by the JSON metrics endpoint."""
-    html = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Distributed Task Queue Dashboard</title>
-  <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 2rem; background: #f4f6f8; color: #102030; }
-    h1 { margin-bottom: 0.5rem; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; margin-top: 1rem; }
-    .card { background: white; border-radius: 12px; padding: 1rem; box-shadow: 0 4px 14px rgba(0,0,0,0.08); }
-    pre { background: #0f172a; color: #e2e8f0; padding: 1rem; border-radius: 12px; overflow: auto; }
-    .muted { color: #52606d; }
-  </style>
-</head>
-<body>
-  <h1>Distributed Task Queue Dashboard</h1>
-  <p class="muted">Refreshes every 2 seconds using <code>/metrics</code>.</p>
-  <div id="cards" class="grid"></div>
-  <h2>Raw Metrics</h2>
-  <pre id="raw">Loading...</pre>
-  <script>
-    async function refresh() {
-      const response = await fetch('/metrics');
-      const data = await response.json();
-      const cards = [
-        ['Pending', data.status_counts.pending],
-        ['Scheduled', data.status_counts.scheduled],
-        ['Running', data.status_counts.running],
-        ['Completed', data.status_counts.completed],
-        ['Dead-Lettered', data.status_counts.dead_lettered],
-        ['Active Workers', data.workers.active_count]
-      ];
-      document.getElementById('cards').innerHTML = cards
-        .map(([label, value]) => `<div class="card"><strong>${label}</strong><div style="font-size:2rem;margin-top:0.5rem;">${value}</div></div>`)
-        .join('');
-      document.getElementById('raw').textContent = JSON.stringify(data, null, 2);
-    }
-    refresh();
-    setInterval(refresh, 2000);
-  </script>
-</body>
-</html>
-"""
-    return HTMLResponse(content=html)
+    """Serve the local job management console."""
+    return HTMLResponse(Path(__file__).with_name("dashboard.html").read_text())
+
+
+@app.exception_handler(ValueError)
+async def conflict_handler(request: Request, exc: ValueError):
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+
+@app.exception_handler(SQLAlchemyError)
+async def history_unavailable(request: Request, exc: SQLAlchemyError):
+    return JSONResponse(status_code=503, content={"detail": "History database unavailable; queued events will be retried."})
+
+
+@app.get("/tasks")
+def list_tasks(status: TaskStatus | None = None, task_type: str | None = None,
+               search: str = Query(default="", max_length=100),
+               offset: int = Query(default=0, ge=0), limit: int = Query(default=25, ge=1, le=100)):
+    return get_task_store().list_tasks(status=status.value if status else None,
+        task_type=task_type, search=search, offset=offset, limit=limit)
+
+
+@app.get("/task-types")
+def task_types():
+    return {"items": available_task_types()}
+
+
+def control(task_id, action):
+    try:
+        return get_task_store().control_task(task_id, action)
+    except KeyError:
+        raise HTTPException(404, "Task not found")
+
+
+@app.post("/tasks/{task_id}/cancel", response_model=TaskResponse)
+def cancel_task(task_id: str):
+    return control(task_id, "cancel")
+
+
+@app.post("/tasks/{task_id}/retry", response_model=TaskResponse)
+def retry_task(task_id: str):
+    return control(task_id, "retry")
+
+
+@app.get("/schedules")
+def list_schedules():
+    return {"items": RecurringStore(get_task_store()).list()}
+
+
+@app.post("/schedules", status_code=201)
+def create_schedule(submission: RecurringSubmission):
+    if get_task(submission.task.task_type) is None:
+        raise HTTPException(400, "Unknown task type")
+    return RecurringStore(get_task_store()).create(submission.name, submission.interval_seconds,
+                                                 submission.task.model_dump(mode="json"))
+
+
+@app.patch("/schedules/{schedule_id}")
+def update_schedule(schedule_id: str, update: RecurringUpdate):
+    try:
+        return RecurringStore(get_task_store()).update(schedule_id, update.enabled)
+    except KeyError:
+        raise HTTPException(404, "Schedule not found")

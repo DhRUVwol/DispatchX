@@ -53,5 +53,18 @@ services:
       migrate:
         condition: service_completed_successfully
 
+  history-relay:
+    build: .
+    command: python -m app.history_relay
+    restart: unless-stopped
+    environment:
+      <<: *history-env
+      REDIS_HOST: redis
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
 volumes:
   dispatchx_pgdata:

@@ -16,8 +16,10 @@ Terminal failures are also pushed to a dedicated dead-letter list.
 from __future__ import annotations
 
 import json
+import hashlib
+from contextlib import nullcontext
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional, cast
 
 import redis
@@ -156,6 +158,8 @@ class TaskStore:
         timeout_seconds: Optional[int] = None,
         priority: str | TaskPriority | None = None,
         run_at: Optional[datetime] = None,
+        idempotency_key: str | None = None,
+        _pipeline: Any = None,
     ) -> dict:
         """Create a task record and either enqueue or schedule it."""
         task_id = str(uuid.uuid4())
@@ -189,23 +193,252 @@ class TaskStore:
             "updated_at": now.isoformat(),
         }
 
-        pipeline = self._redis.pipeline()
-        pipeline.hset(self._task_key(task_id), mapping=task_data)
-        if is_scheduled:
-            assert normalized_run_at is not None
-            self._schedule_task_in_pipeline(pipeline, task_id, normalized_run_at)
-        else:
-            self._enqueue_runnable(pipeline, task_id, effective_priority)
-        self._status_transition(pipeline, None, task_data["status"])
-        self._metrics_increment(pipeline, self.metrics_stats_key, "tasks_created_total")
-        pipeline.execute()
-        return self._deserialize_task(task_data)
+        fingerprint = hashlib.sha256(json.dumps({
+            "task_type": task_type, "args": args or [], "kwargs": kwargs or {},
+            "timeout": effective_timeout, "priority": effective_priority,
+            "run_at": task_data["run_at"],
+        }, sort_keys=True).encode()).hexdigest()
+        idem_key = (f"{self._queue_name}:idempotency:" + hashlib.sha256(idempotency_key.encode()).hexdigest()
+                    if idempotency_key else None)
+        while True:
+            with (nullcontext(_pipeline) if _pipeline is not None else self._redis.pipeline()) as pipeline:
+                try:
+                    if idem_key:
+                        pipeline.watch(idem_key)
+                        existing = pipeline.hgetall(idem_key)
+                        if existing:
+                            if existing["fingerprint"] != fingerprint:
+                                raise ValueError("Idempotency key already used with a different request")
+                            task = self.get_task(existing["task_id"])
+                            if task is None:
+                                raise ValueError("Original idempotent task is no longer available")
+                            return task
+                    pipeline.multi()
+                    pipeline.hset(self._task_key(task_id), mapping=task_data)
+                    if idem_key:
+                        pipeline.hset(idem_key, mapping={"task_id": task_id, "fingerprint": fingerprint})
+                    if is_scheduled:
+                        self._schedule_task_in_pipeline(pipeline, task_id, normalized_run_at)
+                    else:
+                        self._enqueue_runnable(pipeline, task_id, effective_priority)
+                    self._status_transition(pipeline, None, task_data["status"])
+                    self._metrics_increment(pipeline, self.metrics_stats_key, "tasks_created_total")
+                    self._event(pipeline, "submitted", task_data)
+                    if _pipeline is None:
+                        pipeline.execute()
+                    return self._deserialize_task(task_data)
+                except redis.WatchError:
+                    continue
+
+    @property
+    def outbox_key(self) -> str:
+        return f"{self._queue_name}:history_outbox"
+
+    def _event(self, pipeline: Any, event_type: str, raw: dict) -> None:
+        # Written in the SAME transaction as the job transition.
+        pipeline.xadd(self.outbox_key, {"event_type": event_type, "snapshot": json.dumps(raw)})
+
+    def list_tasks(self, *, status: str | None = None, task_type: str | None = None,
+                   search: str = "", offset: int = 0, limit: int = 25) -> dict:
+        # SCAN supports existing jobs without requiring a destructive index rebuild.
+        tasks = []
+        for key in self._redis.scan_iter(match="task:*"):
+            raw = self._redis.hgetall(key)
+            if not raw or "task_id" not in raw:
+                continue
+            if status and raw.get("status") != status:
+                continue
+            if task_type and raw.get("task_type") != task_type:
+                continue
+            if search.lower() not in raw["task_id"].lower():
+                continue
+            tasks.append(self._deserialize_task(raw))
+        tasks.sort(key=lambda t: (t["created_at"], t["task_id"]), reverse=True)
+        return {"items": tasks[offset:offset + limit], "total": len(tasks),
+                "offset": offset, "limit": limit}
+
+    def control_task(self, task_id: str, action: str) -> dict:
+        if action not in {"cancel", "retry"}:
+            raise ValueError("Unknown task action")
+        key = self._task_key(task_id)
+        while True:
+            with self._redis.pipeline() as pipe:
+                try:
+                    pipe.watch(key)
+                    raw = pipe.hgetall(key)
+                    if not raw:
+                        raise KeyError(task_id)
+                    old = raw["status"]
+                    allowed = {"pending", "scheduled"} if action == "cancel" else {"dead_lettered", "failed"}
+                    if old not in allowed:
+                        raise ValueError(f"Cannot {action} a {old} task")
+                    updates = {"status": "cancelled" if action == "cancel" else "pending",
+                               "updated_at": self._now_iso(), "execution_token": ""}
+                    if action == "retry":
+                        # Preserve lifetime attempts and immutable history; reset the retry budget.
+                        updates.update(retry_count="0", run_at="", result="", last_error="",
+                                       failure_type="", failure_reason="", dead_lettered_at="", worker_id="")
+                    pipe.multi()
+                    pipe.hset(key, mapping=updates)
+                    for queue in self.runnable_queue_names():
+                        pipe.lrem(queue, 0, task_id)
+                    pipe.zrem(self.scheduled_queue_name, task_id)
+                    pipe.lrem(self.dead_letter_queue_name, 0, task_id)
+                    if action == "retry":
+                        self._enqueue_runnable(pipe, task_id, raw["priority"])
+                    self._status_transition(pipe, old, updates["status"])
+                    raw.update(updates)
+                    self._event(pipe, "cancelled" if action == "cancel" else "manually_retried", raw)
+                    pipe.execute()
+                    return self._deserialize_task(raw)
+                except redis.WatchError:
+                    continue
 
     def get_task(self, task_id: str) -> Optional[dict]:
         data = cast(dict[str, str], self._redis.hgetall(self._task_key(task_id)))
         if not data:
             return None
         return self._deserialize_task(data)
+
+    @property
+    def processing_key(self) -> str:
+        """Deadlines for in-flight tasks; the hash holds the ownership token."""
+        return f"{self._queue_name}:processing"
+
+    def claim_task(self, worker_id: str, task_id: str | None = None) -> dict | None:
+        """Atomically dequeue, start and lease one task, in priority/FIFO order.
+
+        A sorted set is the processing/ack mechanism. There is no destructive
+        dequeue outside this script, including when a caller requests a task ID.
+        Redis TIME keeps lease comparisons independent of worker clock skew.
+        """
+        token = uuid.uuid4().hex
+        script = """
+local t = redis.call('TIME')
+local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+for i = 1, 3 do
+  local id
+  if ARGV[5] ~= '' then
+    id = ARGV[5]
+    if redis.call('LREM', KEYS[i], 1, id) == 0 then id = nil end
+  else
+    id = redis.call('RPOP', KEYS[i])
+  end
+  if id then
+    local key = 'task:' .. id
+    if redis.call('HGET', key, 'status') == 'pending' then
+      local deadline = now + tonumber(redis.call('HGET', key, 'timeout_seconds')) + tonumber(ARGV[4])
+      redis.call('HSET', key, 'status', 'running', 'worker_id', ARGV[1],
+        'execution_token', ARGV[2], 'updated_at', ARGV[3])
+      redis.call('HINCRBY', key, 'attempt_count', 1)
+      redis.call('ZADD', KEYS[4], deadline, id)
+      redis.call('HINCRBY', KEYS[5], 'pending', -1)
+      redis.call('HINCRBY', KEYS[5], 'running', 1)
+      local snapshot = {}
+      local fields = redis.call('HGETALL', key)
+      for n = 1, #fields, 2 do snapshot[fields[n]] = fields[n+1] end
+      redis.call('XADD', KEYS[6], '*', 'event_type', 'attempt_started', 'snapshot', cjson.encode(snapshot))
+      return fields
+    end
+  end
+end
+return nil
+"""
+        values = self._redis.eval(
+            script, 6, *self.runnable_queue_names(), self.processing_key,
+            self.metrics_status_key, self.outbox_key, worker_id, token, self._now_iso(),
+            settings.worker_recovery_grace, task_id or "",
+        )
+        if not values:
+            return None
+        return dict(zip(values[::2], values[1::2]))
+
+    def finish_execution(
+        self, task_id: str, token: str, *, result: Any = None,
+        error_message: str | None = None, failure_type: str | None = None,
+        failure_reason: str | None = None, expired_only: bool = False,
+    ) -> dict | None:
+        """Fence stale owners and atomically ack with completion/retry/DLQ state.
+
+        Recovery uses this same transition with expired_only=True, so racing
+        recoverers and a late completion can commit at most one outcome.
+        """
+        key = self._task_key(task_id)
+        while True:
+            with self._redis.pipeline() as pipe:
+                try:
+                    pipe.watch(key, self.processing_key)
+                    raw = pipe.hgetall(key)
+                    deadline = pipe.zscore(self.processing_key, task_id)
+                    if (raw.get("status") != "running"
+                            or raw.get("execution_token") != token or deadline is None):
+                        return None
+                    seconds, micros = pipe.time()
+                    now_score = seconds + micros / 1_000_000
+                    if expired_only and deadline > now_score:
+                        return None
+                    now = datetime.fromtimestamp(now_score, timezone.utc)
+                    updates = {"updated_at": now.isoformat(), "execution_token": ""}
+                    retry_count = int(raw["retry_count"])
+                    if error_message is None:
+                        status = "completed"
+                        updates.update(result=json.dumps(result), last_error="",
+                                       failure_type="", failure_reason="")
+                    else:
+                        updates.update(last_error=error_message, failure_type=failure_type or "exception",
+                                       failure_reason=failure_reason or "", last_failure_at=now.isoformat(),
+                                       first_failure_at=raw.get("first_failure_at") or now.isoformat())
+                        if failure_type != "unknown_task" and retry_count < int(raw["max_retries"]):
+                            status = "scheduled"
+                            run_at = now + timedelta(seconds=2 ** retry_count)
+                            updates.update(retry_count=str(retry_count + 1), run_at=run_at.isoformat())
+                        else:
+                            status = "dead_lettered"
+                            updates.update(result=json.dumps(error_message), dead_lettered_at=now.isoformat())
+                    updates["status"] = status
+                    pipe.multi()
+                    pipe.hset(key, mapping=updates)
+                    pipe.zrem(self.processing_key, task_id)
+                    self._status_transition(pipe, "running", status)
+                    if status == "completed":
+                        self._metrics_increment(pipe, self.metrics_stats_key, "tasks_completed_total")
+                    else:
+                        self._metrics_increment(pipe, self.metrics_stats_key, "task_failures_total")
+                        if failure_type == "timeout":
+                            self._metrics_increment(pipe, self.metrics_stats_key, "task_timeouts_total")
+                        if status == "scheduled":
+                            self._schedule_task_in_pipeline(pipe, task_id, run_at)
+                            self._metrics_increment(pipe, self.metrics_stats_key, "task_retries_total")
+                        else:
+                            pipe.lpush(self._dead_letter_queue_name, task_id)
+                            self._metrics_increment(pipe, self.metrics_stats_key, "dead_lettered_total")
+                    raw.update(updates)
+                    if error_message is not None:
+                        self._event(pipe, "attempt_failed", raw)
+                    self._event(pipe, {"completed": "completed", "scheduled": "retry_scheduled",
+                                       "dead_lettered": "dead_lettered"}[status], raw)
+                    pipe.execute()
+                    return self._deserialize_task(raw)
+                except redis.WatchError:
+                    continue
+
+    def recover_expired_tasks(self, limit: int = 100) -> int:
+        """Any live worker may reclaim expired attempts; no leader is required."""
+        seconds, micros = self._redis.time()
+        ids = self._redis.zrangebyscore(
+            self.processing_key, "-inf", seconds + micros / 1_000_000, start=0, num=limit,
+        )
+        recovered = 0
+        for task_id in ids:
+            token = self._redis.hget(self._task_key(task_id), "execution_token")
+            if token and self.finish_execution(
+                task_id, token, expired_only=True,
+                error_message="Worker execution lease expired before acknowledgment.",
+                failure_type="worker_crash",
+                failure_reason="Worker did not acknowledge within the task timeout plus recovery grace.",
+            ) is not None:
+                recovered += 1
+        return recovered
 
     def mark_running(self, task_id: str, worker_id: str) -> Optional[dict]:
         existing = self.get_task(task_id)
@@ -428,6 +661,10 @@ for _, task_id in ipairs(due_ids) do
     redis.call('HINCRBY', metrics_status_key, 'scheduled', -1)
     redis.call('HINCRBY', metrics_status_key, 'pending', 1)
     redis.call('HINCRBY', metrics_stats_key, 'scheduled_promotions_total', 1)
+    local snapshot = {}
+    local fields = redis.call('HGETALL', task_key)
+    for n = 1, #fields, 2 do snapshot[fields[n]] = fields[n+1] end
+    redis.call('XADD', queue_prefix .. ':history_outbox', '*', 'event_type', 'promoted', 'snapshot', cjson.encode(snapshot))
     promoted = promoted + 1
   end
 end
@@ -492,6 +729,7 @@ return promoted
                 TaskStatus.RUNNING.value,
                 TaskStatus.COMPLETED.value,
                 TaskStatus.FAILED.value,
+                TaskStatus.CANCELLED.value,
                 TaskStatus.DEAD_LETTERED.value,
             )
         }
@@ -525,6 +763,7 @@ return promoted
                 "dead_lettered_total": stats["dead_lettered_total"],
             },
             "workers": self.get_worker_activity(),
+            "history_pending_events": self._redis.xlen(self.outbox_key),
         }
 
     def dead_letter_size(self) -> int:
